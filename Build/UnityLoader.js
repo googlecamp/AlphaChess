@@ -763,6 +763,7 @@ var UnityLoader = UnityLoader || {
         }
         return 0;
       })(),
+      hasThreads: typeof SharedArrayBuffer !== 'undefined',
       hasWasm: typeof WebAssembly == "object" && typeof WebAssembly.validate == "function" && typeof WebAssembly.compile == "function",
     };
 
@@ -792,32 +793,10 @@ var UnityLoader = UnityLoader || {
     script.onload = function () {
       URL.revokeObjectURL(blobUrl);
       onload(functionId);
+      delete script.onload;
     }
     document.body.appendChild(script);
 
-  },
-  allocateHeapJob: function (Module, job) {
-    var TOTAL_STACK = Module["TOTAL_STACK"] || 5 * 1024 * 1024;
-    var TOTAL_MEMORY = Module["TOTAL_MEMORY"] || (Module["buffer"] ? Module["buffer"].byteLength : 256 * 1024 * 1024);
-    var WASM_PAGE_SIZE = 64 * 1024, ASM_MEMORY_GRANULARITY = 16 * 1024 * 1024;
-    var totalMemory = WASM_PAGE_SIZE;
-    while (totalMemory < TOTAL_MEMORY || totalMemory < 2 * TOTAL_STACK)
-      totalMemory += totalMemory < ASM_MEMORY_GRANULARITY ? totalMemory : ASM_MEMORY_GRANULARITY;
-    if (totalMemory != TOTAL_MEMORY)
-      Module.printErr("increasing TOTAL_MEMORY to " + totalMemory + " to be compliant with the asm.js spec (and given that TOTAL_STACK=" + TOTAL_STACK + ")");
-    TOTAL_MEMORY = totalMemory;
-    if (job.parameters.useWasm) {
-      Module["wasmMemory"] = new WebAssembly.Memory({ initial: TOTAL_MEMORY / WASM_PAGE_SIZE, maximum: TOTAL_MEMORY / WASM_PAGE_SIZE });
-      Module["buffer"] = Module["wasmMemory"].buffer;
-    } else if (!Module["buffer"]) {
-      Module["buffer"] = new ArrayBuffer(TOTAL_MEMORY);
-    } else if (Module["buffer"].byteLength != TOTAL_MEMORY) {
-      Module.printErr("provided buffer should be " + TOTAL_MEMORY + " bytes, but it is " + Module["buffer"].byteLength + ", reallocating the buffer");
-      Module["buffer"] = new ArrayBuffer(TOTAL_MEMORY);
-    }
-    Module["TOTAL_MEMORY"] = Module["buffer"].byteLength;
-    job.complete();
-    
   },
   setupIndexedDBJob: function (Module, job) {
     function setupIndexedDB(idb) {
@@ -838,50 +817,16 @@ var UnityLoader = UnityLoader || {
     }
     
   },
-  initWasmCache: function (Module, urlId) {
-    if (!Module.cacheControl || ["must-revalidate", "immutable"].indexOf(Module.cacheControl[urlId] || Module.cacheControl["default"]) == -1)
-      return;
-    Module.wasmCache = {
-      update: function () {
-        var wasm = this;
-        if (wasm.cache && wasm.download && wasm.request) {
-          if (wasm.cache.module && wasm.cache.md5 == wasm.download.md5) {
-            wasm.request.wasmInstantiate(wasm.cache.module).then(function (result) {
-              console.log("[Unity Cache] WebAssembly module '" + wasm.cache.url + "' successfully loaded from the indexedDB cache");
-              wasm.request.callback(result);
-            });
-          } else {
-            wasm.request.wasmInstantiate(wasm.download.binary).then(function (result) {
-              wasm.cache.module = result.module;
-              wasm.cache.md5 = wasm.download.md5;
-              UnityLoader.UnityCache.WebAssembly.put(wasm.cache, function () {
-                console.log("[Unity Cache] WebAssembly module '" + wasm.cache.url + "' successfully stored in the indexedDB cache");
-              }, function (error) {
-                console.log("[Unity Cache] WebAssembly module '" + wasm.cache.url + "' not stored in the indexedDB cache due to the error: " + error);
-              });
-              wasm.request.callback(result.instance);
-            });
-          }
-        }
-      },
-    };
-    UnityLoader.UnityCache.WebAssembly.get(Module.resolveBuildUrl(Module[urlId]), function (result) { Module.wasmCache.cache = result; Module.wasmCache.update(); });
-    
-  },
   processWasmCodeJob: function (Module, job) {
     Module.wasmBinary = UnityLoader.Job.result(Module, "downloadWasmCode");
-    if (Module.wasmCache) {
-      Module.wasmCache.download = {
-        binary: Module.wasmBinary,
-        md5: [].slice.call(UnityLoader.Cryptography.md5(Module.wasmBinary)).map(function(x) { return ("0" + x.toString(16)).substr(-2); }).join(""),
-      };
-      Module.wasmCache.update();
-    }
     job.complete();
     
   },
   processWasmFrameworkJob: function (Module, job) {
-    UnityLoader.loadCode(UnityLoader.Job.result(Module, "downloadWasmFramework"), function (id) {
+    var code = UnityLoader.Job.result(Module, "downloadWasmFramework");
+    UnityLoader.loadCode(code, function (id) {
+      var blob = new Blob([code], { type: "application/javascript" });
+      Module["mainScriptUrlOrBlob"] = blob;
       UnityLoader[id](Module);
       job.complete();
     }, {Module: Module, url: Module["wasmFrameworkUrl"]});
@@ -896,15 +841,18 @@ var UnityLoader = UnityLoader || {
     
   },
   processAsmFrameworkJob: function (Module, job) {
-    UnityLoader.loadCode(UnityLoader.Job.result(Module, "downloadAsmFramework"), function (id) {
+    var code = UnityLoader.Job.result(Module, "downloadAsmFramework");
+    UnityLoader.loadCode(code, function (id) {
+      var blob = new Blob([code], { type: "application/javascript" });
+      Module["mainScriptUrlOrBlob"] = blob;
       UnityLoader[id](Module);
       job.complete();
     }, {Module: Module, url: Module["asmFrameworkUrl"]});
     
   },
-  processAsmMemoryJob: function (Module, job) {
+  processMemoryInitializerJob: function (Module, job) {
     Module["memoryInitializerRequest"].status = 200;
-    Module["memoryInitializerRequest"].response = UnityLoader.Job.result(Module, "downloadAsmMemory");
+    Module["memoryInitializerRequest"].response = UnityLoader.Job.result(Module, "downloadMemoryInitializer");
     if (Module["memoryInitializerRequest"].callback)
       Module["memoryInitializerRequest"].callback();
     job.complete();
@@ -962,17 +910,22 @@ var UnityLoader = UnityLoader || {
     Module.useWasm = Module["wasmCodeUrl"] && UnityLoader.SystemInfo.hasWasm;
     
     if (Module.useWasm) {
-      UnityLoader.initWasmCache(Module, "wasmCodeUrl");
       UnityLoader.scheduleBuildDownloadJob(Module, "downloadWasmCode", "wasmCodeUrl");
       UnityLoader.Job.schedule(Module, "processWasmCode", ["downloadWasmCode"], UnityLoader.processWasmCodeJob);
+      if (Module["wasmMemoryUrl"])
+      {
+        UnityLoader.scheduleBuildDownloadJob(Module, "downloadMemoryInitializer", "wasmMemoryUrl");
+        UnityLoader.Job.schedule(Module, "processMemoryInitializer", ["downloadMemoryInitializer"], UnityLoader.processMemoryInitializerJob);
+        Module["memoryInitializerRequest"] = { addEventListener: function (type, callback) { Module["memoryInitializerRequest"].callback = callback; } }        
+      }
       UnityLoader.scheduleBuildDownloadJob(Module, "downloadWasmFramework", "wasmFrameworkUrl");
       UnityLoader.Job.schedule(Module, "processWasmFramework", ["downloadWasmFramework", "processWasmCode", "setupIndexedDB"], UnityLoader.processWasmFrameworkJob);
 
     } else if (Module["asmCodeUrl"]) {
       UnityLoader.scheduleBuildDownloadJob(Module, "downloadAsmCode", "asmCodeUrl");
       UnityLoader.Job.schedule(Module, "processAsmCode", ["downloadAsmCode"], UnityLoader.processAsmCodeJob);
-      UnityLoader.scheduleBuildDownloadJob(Module, "downloadAsmMemory", "asmMemoryUrl");
-      UnityLoader.Job.schedule(Module, "processAsmMemory", ["downloadAsmMemory"], UnityLoader.processAsmMemoryJob);
+      UnityLoader.scheduleBuildDownloadJob(Module, "downloadMemoryInitializer", "asmMemoryUrl");
+      UnityLoader.Job.schedule(Module, "processMemoryInitializer", ["downloadMemoryInitializer"], UnityLoader.processMemoryInitializerJob);
       Module["memoryInitializerRequest"] = { addEventListener: function (type, callback) { Module["memoryInitializerRequest"].callback = callback; } }
       if (Module.asmLibraryUrl)
         Module.dynamicLibraries = [Module.asmLibraryUrl].map(Module.resolveBuildUrl);
@@ -1093,17 +1046,7 @@ var UnityLoader = UnityLoader || {
         buildDownloadProgress: {},
         resolveBuildUrl: function (buildUrl) { return buildUrl.match(/(http|https|ftp|file):\/\//) ? buildUrl : url.substring(0, url.lastIndexOf("/") + 1) + buildUrl; },
         streamingAssetsUrl: function () { return resolveURL(this.resolveBuildUrl("../StreamingAssets")) },
-        wasmRequest: function (wasmInstantiate, callback) {
-          if (this.wasmCache) {
-            this.wasmCache.request = {
-              wasmInstantiate: wasmInstantiate,
-              callback: callback,
-            };
-            this.wasmCache.update();
-          } else {
-            wasmInstantiate(this.wasmBinary).then(function (result) { callback(result.instance); });
-          }
-        },
+        pthreadMainPrefixURL: "Build/",
       },
       SetFullscreen: function() {
         if (gameInstance.Module.SetFullscreen)
